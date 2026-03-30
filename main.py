@@ -2,11 +2,15 @@
 股票雷达 (Stock Radar)
 A股每周交易日，9:15 ~ 14:55 每30分钟推送分析报告
 
+新增功能：
+  - 每日 08:00 晨间要闻推送（含非交易日）
+  - 美股/越南/印度/日本/港澳台各市场收盘后30分钟推送
+
 目标股票：江山股份、科创100ETF、科创50ETF
 
 【节假日过滤】
 使用 akshare 的 tool_trade_date_hist_sina 接口获取 A 股实际交易日历，
-自动过滤节假日，当天非交易日时跳过推送。
+自动过滤节假日，当天非交易日时跳过A股分析推送，但晨报和全球市场推送不受影响。
 """
 import schedule
 import time
@@ -21,6 +25,7 @@ from fetcher import (
 )
 from analyzer import build_stock_report, build_market_report
 from notifier import notify
+from news_fetcher import get_morning_news, get_global_market_close, GLOBAL_MARKETS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,10 +49,9 @@ def _load_trade_dates(year: int) -> set[str]:
     try:
         import akshare as ak
         df = ak.tool_trade_date_hist_sina()
-        # 列名: trade_date, 类型: object(str) 或 Timestamp
         dates: set[str] = set()
         for val in df["trade_date"]:
-            s = str(val)[:10]  # 取 YYYY-MM-DD
+            s = str(val)[:10]
             if s.startswith(str(year)):
                 dates.add(s)
         _trade_dates_cache = dates
@@ -62,21 +66,23 @@ def _load_trade_dates(year: int) -> set[str]:
 def is_trading_day() -> bool:
     """判断今天是否为 A 股交易日"""
     now = datetime.now(TZ)
-    # 先排除周末
     if now.weekday() >= 5:
         return False
     today = now.strftime("%Y-%m-%d")
     trade_dates = _load_trade_dates(now.year)
     if trade_dates:
         return today in trade_dates
-    # 降级：只过滤周末
     return True
 
 
+# ────────────────────────────────────────────────
+# A股分析推送（交易日专属）
+# ────────────────────────────────────────────────
+
 def run_analysis():
-    """执行一次完整分析并推送"""
+    """执行一次完整A股分析并推送（仅交易日）"""
     if not is_trading_day():
-        logger.info("今日非交易日（含节假日），跳过")
+        logger.info("今日非交易日（含节假日），跳过A股分析")
         return
 
     now = datetime.now(TZ)
@@ -114,21 +120,73 @@ def run_analysis():
     notify(full_report)
 
 
+# ────────────────────────────────────────────────
+# 晨间要闻推送（每日08:00，含非交易日）
+# ────────────────────────────────────────────────
+
+def run_morning_news():
+    """推送晨间要闻（每日，不管交易日）"""
+    logger.info("开始获取晨间要闻")
+    try:
+        report = get_morning_news(max_items=12)
+        notify(report)
+        logger.info("晨间要闻推送完成")
+    except Exception as e:
+        logger.error(f"晨间要闻推送失败: {e}")
+        notify(f"⚠️ 晨间要闻获取失败: {e}")
+
+
+# ────────────────────────────────────────────────
+# 全球市场收盘推送
+# ────────────────────────────────────────────────
+
+def make_global_push(market_key: str):
+    """返回一个指定市场的推送函数（用于注册到 schedule）"""
+    def _push():
+        label = GLOBAL_MARKETS.get(market_key, {}).get("label", market_key)
+        logger.info(f"开始推送 {label} 收盘行情")
+        try:
+            report = get_global_market_close(market_key)
+            notify(report)
+            logger.info(f"{label} 收盘行情推送完成")
+        except Exception as e:
+            logger.error(f"{label} 收盘行情推送失败: {e}")
+    _push.__name__ = f"push_{market_key}"
+    return _push
+
+
+# ────────────────────────────────────────────────
+# 定时任务注册
+# ────────────────────────────────────────────────
+
 def setup_schedule():
-    """注册定时任务"""
+    """注册所有定时任务"""
+
+    # 1. A股交易日分析（9:15 ~ 14:55 每30分钟）
     for t in PUSH_TIMES:
         schedule.every().day.at(t).do(run_analysis)
-        logger.info(f"已注册推送时间: {t}")
+        logger.info(f"已注册A股推送时间: {t}")
+
+    # 2. 每日晨间要闻 08:00（含非交易日）
+    schedule.every().day.at("08:00").do(run_morning_news)
+    logger.info("已注册晨间要闻推送: 08:00（每日）")
+
+    # 3. 全球各市场收盘推送
+    for market_key, cfg in GLOBAL_MARKETS.items():
+        push_time = cfg["push_time"]
+        label = cfg["label"]
+        schedule.every().day.at(push_time).do(make_global_push(market_key))
+        logger.info(f"已注册全球市场推送: {label} {push_time}")
 
 
 def main():
     logger.info("🚀 股票雷达启动")
     logger.info(f"目标股票: {[s['name'] for s in TARGET_STOCKS]}")
-    logger.info(f"推送时间: {PUSH_TIMES}")
+    logger.info(f"A股推送时间: {PUSH_TIMES}")
 
     setup_schedule()
 
-    # 启动时立即执行一次（验证功能）
+    # 启动时立即执行一次A股分析（验证功能）
     run_analysis()
 
     while True:
