@@ -157,6 +157,42 @@ def get_stock_realtime(code: str, market: str) -> dict:
     return {}
 
 
+def _get_etf_hist_fallback(code: str) -> pd.DataFrame:
+    """
+    ETF 历史数据专用兜底
+    链路：新浪 fund_etf_hist_sina → 腾讯 stock_zh_a_hist_tx
+    """
+    # 新浪：sh + code
+    try:
+        symbol = f"sh{code}" if code.startswith(("5", "51", "58")) else f"sz{code}"
+        df = ak.fund_etf_hist_sina(symbol=symbol)
+        if not df.empty:
+            logger.info(f"[ETF历史兜底] {code} 新浪接口成功，{len(df)}条")
+            df = df.rename(columns={
+                "date": "日期", "open": "开盘", "close": "收盘",
+                "high": "最高", "low": "最低", "volume": "成交量", "amount": "成交额"
+            })
+            return df.tail(20)
+    except Exception as e:
+        logger.warning(f"[ETF历史兜底] 新浪失败({code}): {e}")
+
+    # 腾讯兜底
+    try:
+        symbol_tx = f"sh{code}" if code.startswith(("5", "51", "58")) else f"sz{code}"
+        start = (datetime.now() - pd.Timedelta(days=30)).strftime("%Y%m%d")
+        end = datetime.now().strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist_tx(symbol=symbol_tx, start_date=start, end_date=end)
+        if not df.empty:
+            logger.info(f"[ETF历史兜底] {code} 腾讯接口成功，{len(df)}条")
+            # 腾讯列名: 日期/开盘/收盘/最高/最低/成交量
+            df.columns = ["日期", "开盘", "收盘", "最高", "最低", "成交量"]
+            return df.tail(20)
+    except Exception as e:
+        logger.warning(f"[ETF历史兜底] 腾讯也失败({code}): {e}")
+
+    return pd.DataFrame()
+
+
 def get_stock_realtime_with_fallback(code: str, market: str) -> dict:
     """
     获取实时行情，若 price=0（收盘/无数据），自动用最近一个交易日历史数据兜底
@@ -168,7 +204,13 @@ def get_stock_realtime_with_fallback(code: str, market: str) -> dict:
     # 实时数据为空或 price=0，用历史收盘数据兜底
     logger.info(f"{code} 实时行情为空，尝试用历史日线兜底")
     try:
-        df = get_stock_kline(code, market, periods=3)
+        # ETF 优先用专用历史接口
+        if _is_etf(code):
+            df = _get_etf_hist_fallback(code)
+            if df.empty:
+                df = get_stock_kline(code, market, periods=3)
+        else:
+            df = get_stock_kline(code, market, periods=3)
         if not df.empty:
             last = df.iloc[-1]
             # 兼容东财/新浪列名
@@ -255,6 +297,12 @@ def get_stock_kline(code: str, market: str, periods: int = 20) -> pd.DataFrame:
                 return df.tail(periods)
         except Exception as e:
             logger.warning(f"[兜底] 新浪日线也失败({code}): {e}")
+
+    # ETF 专用历史接口兜底
+    if _is_etf(code):
+        df = _get_etf_hist_fallback(code)
+        if not df.empty:
+            return df
 
     logger.error(f"❌ {code} K线所有渠道均失败")
     return pd.DataFrame()
