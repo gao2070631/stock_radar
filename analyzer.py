@@ -115,11 +115,16 @@ def build_stock_report(stock_info: dict, kline_df: pd.DataFrame, fund_flow: dict
     sign = "▲" if change_pct >= 0 else "▼"
     color_tag = "🔴" if change_pct >= 0 else "🟢"
 
+    # 收盘数据兜底标注
+    is_history = stock_info.get("_is_history", False)
+    history_date = stock_info.get("_history_date", "")
+    data_label = f"📅 收盘数据（{history_date}）" if is_history else ""
+
     kline_analysis = analyze_kline(kline_df)
     fund_str = analyze_fund_flow(fund_flow)
 
     lines = [
-        f"━━━ {color_tag} {name}（{code}） ━━━",
+        f"━━━ {color_tag} {name}（{code}）{' ' + data_label if data_label else ''} ━━━",
         f"现价：{price}  涨跌：{sign}{abs(change_pct):.2f}%（{sign}{abs(change_amt):.3f}）",
         f"成交量：{format_amount(volume * 100)}股  成交额：{format_amount(amount)}",
         f"换手率：{turnover:.2f}%",

@@ -157,6 +157,66 @@ def get_stock_realtime(code: str, market: str) -> dict:
     return {}
 
 
+def get_stock_realtime_with_fallback(code: str, market: str) -> dict:
+    """
+    获取实时行情，若 price=0（收盘/无数据），自动用最近一个交易日历史数据兜底
+    """
+    data = get_stock_realtime(code, market)
+    if data and float(data.get("price", 0)) > 0:
+        return data
+
+    # 实时数据为空或 price=0，用历史收盘数据兜底
+    logger.info(f"{code} 实时行情为空，尝试用历史日线兜底")
+    try:
+        df = get_stock_kline(code, market, periods=3)
+        if not df.empty:
+            last = df.iloc[-1]
+            # 兼容东财/新浪列名
+            def _col(candidates):
+                for c in candidates:
+                    if c in df.columns:
+                        return float(last.get(c, 0) or 0)
+                return 0.0
+
+            close = _col(["收盘", "close"])
+            open_ = _col(["开盘", "open"])
+            high  = _col(["最高", "high"])
+            low   = _col(["最低", "low"])
+            vol   = _col(["成交量", "volume"])
+            amt   = _col(["成交额", "amount"])
+            date  = str(last.get("日期", last.get("date", "")))[:10]
+
+            # 计算涨跌（用前一天收盘）
+            prev_close = 0.0
+            if len(df) >= 2:
+                prev_close = float(df.iloc[-2].get("收盘", df.iloc[-2].get("close", 0)) or 0)
+            change_amt = round(close - prev_close, 3) if prev_close else 0
+            change_pct = round(change_amt / prev_close * 100, 2) if prev_close else 0
+
+            logger.info(f"{code} 使用历史收盘数据兜底：{date} 收盘价 {close}")
+            result = data.copy() if data else {}
+            result.update({
+                "code": code,
+                "price": close,
+                "change_pct": change_pct,
+                "change_amt": change_amt,
+                "volume": vol,
+                "amount": amt,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "_is_history": True,
+                "_history_date": date,
+            })
+            if not result.get("name"):
+                result["name"] = code
+            return result
+    except Exception as e:
+        logger.warning(f"历史数据兜底失败({code}): {e}")
+
+    return data
+
+
 # ────────────────────────────────────────────────
 # K 线（主 + 兜底）
 # ────────────────────────────────────────────────

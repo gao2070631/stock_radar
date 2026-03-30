@@ -20,7 +20,7 @@ import pytz
 
 from config import TARGET_STOCKS, PUSH_TIMES
 from fetcher import (
-    get_stock_realtime, get_stock_kline, get_fund_flow,
+    get_stock_realtime, get_stock_realtime_with_fallback, get_stock_kline, get_fund_flow,
     get_market_index, get_sector_performance, get_market_breadth
 )
 from analyzer import build_stock_report, build_market_report
@@ -96,7 +96,7 @@ def run_analysis():
         code = stock["code"]
         market = stock["market"]
         try:
-            realtime = get_stock_realtime(code, market)
+            realtime = get_stock_realtime_with_fallback(code, market)
             kline = get_stock_kline(code, market, periods=20)
             flow = get_fund_flow(code)
             report = build_stock_report(realtime, kline, flow)
