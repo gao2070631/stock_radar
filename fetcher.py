@@ -1,31 +1,57 @@
 """
-数据获取模块 - 基于 akshare（主数据源）+ 新浪/腾讯（兜底备用）
+数据获取模块 - 基于 akshare
 
-兜底策略：
-  - 每个接口均有 try/except，失败时自动降级到备用数据源
-  - 实时行情：akshare 东财 → akshare 新浪 → 空字典（报警）
-  - K线：akshare 东财 → akshare 新浪 → 空 DataFrame（报警）
-  - 资金流向：akshare 东财 → 空字典（仅日内有效，无其他可靠备源）
-  - 大盘指数：akshare 东财 → akshare 新浪 → 空字典
-  - 板块行情：akshare 东财（字段自适应）→ 降级跳过
+策略：
+  - 东财接口优先（当可用时效果最好）
+  - 新浪接口作为主要兜底（稳定性更高）
+  - 所有接口均有 try/except，失败时自动降级
+  - 实时行情：东财 → 新浪日线最新收盘（兜底）
+  - K线：东财 → 新浪日线
+  - ETF历史：新浪 fund_etf_hist_sina（东财不稳定时主力）
+  - 大盘指数：东财 → 新浪 stock_zh_index_spot_sina
+  - 资金流向：东财（无可靠备源，失败返回空）
 """
 import akshare as ak
 import pandas as pd
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
 import logging
+from datetime import timezone as _tz_module
 
 logger = logging.getLogger(__name__)
+
+# 固定东八区
+_CST = _tz_module(timedelta(hours=8))
+
+def _now_cst():
+    return datetime.now(_CST)
 
 # ────────────────────────────────────────────────
 # 内部工具
 # ────────────────────────────────────────────────
 
+def _is_etf(code: str) -> bool:
+    """判断是否为 ETF（以5或15开头的6位纯数字）"""
+    return code.startswith("5") or code.startswith("15")
+
+
+def _sina_prefix(code: str) -> str:
+    """
+    给代码加新浪前缀
+    上交所（sh）：以 0、6 开头的 A 股，以 5 开头的 ETF（上交所科创/主板ETF）
+    深交所（sz）：以 0、3 开头的深市A股，以 15 开头的 ETF（深市ETF）
+    """
+    if code.startswith("6") or code.startswith("0") or code.startswith("5") or code.startswith("58"):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
 def _parse_spot_row(r, code: str) -> dict:
-    """统一解析行情行（兼容东财/新浪字段差异）"""
+    """统一解析东财行情行"""
     def _f(keys, default=0.0):
         for k in keys:
             v = r.get(k)
-            if v is not None and v != "" and str(v).strip() != "-":
+            if v is not None and v != "" and str(v).strip() not in ("-", "nan"):
                 try:
                     return float(v)
                 except (ValueError, TypeError):
@@ -34,7 +60,7 @@ def _parse_spot_row(r, code: str) -> dict:
 
     return {
         "code": code,
-        "name": r.get("名称", r.get("name", "")),
+        "name": str(r.get("名称", r.get("name", ""))),
         "price": _f(["最新价", "最新"]),
         "change_pct": _f(["涨跌幅"]),
         "change_amt": _f(["涨跌额"]),
@@ -52,23 +78,84 @@ def _parse_spot_row(r, code: str) -> dict:
     }
 
 
-def _is_etf(code: str) -> bool:
-    """判断是否为 ETF（以5开头的纯数字，或含字母）"""
-    return code.startswith("5") or code.startswith("15") or not code.isdigit()
+# ────────────────────────────────────────────────
+# 新浪实时报价（逐只查询，稳定可靠）
+# ────────────────────────────────────────────────
+
+_SINA_HQ_URL = "https://hq.sinajs.cn/list={symbols}"
+_SINA_HQ_HEADERS = {
+    "Referer": "https://finance.sina.com.cn",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+}
+
+
+def _get_sina_realtime(codes: list[str]) -> dict[str, dict]:
+    """
+    通过新浪 hq.sinajs.cn 获取实时行情（支持A股+ETF，今日数据）
+    codes: list of 带前缀代码, 如 ['sh600389', 'sh588190']
+    返回: {code_without_prefix: info_dict}
+    """
+    symbols = ",".join(codes)
+    try:
+        r = requests.get(
+            _SINA_HQ_URL.format(symbols=symbols),
+            headers=_SINA_HQ_HEADERS,
+            timeout=8,
+        )
+        r.encoding = "gbk"
+        result = {}
+        for line in r.text.strip().split("\n"):
+            line = line.strip()
+            if not line or '=""' in line:
+                continue
+            # var hq_str_sh600389="..."
+            try:
+                key_part, val_part = line.split("=", 1)
+                prefix_code = key_part.strip().replace("var hq_str_", "")
+                raw_code = prefix_code[2:]  # 去掉 sh/sz 前缀
+                val = val_part.strip().strip('";')
+                fields = val.split(",")
+                if len(fields) < 10:
+                    continue
+                price = float(fields[3]) if fields[3] else 0.0
+                result[raw_code] = {
+                    "code": raw_code,
+                    "name": fields[0],
+                    "price": price,
+                    "open":  float(fields[1]) if fields[1] else 0.0,
+                    "close_prev": float(fields[2]) if fields[2] else 0.0,
+                    "high": float(fields[4]) if fields[4] else 0.0,
+                    "low":  float(fields[5]) if fields[5] else 0.0,
+                    "volume": float(fields[8]) if fields[8] else 0.0,
+                    "amount": float(fields[9]) if fields[9] else 0.0,
+                    "change_amt": round(price - float(fields[2]), 3) if fields[2] and price else 0.0,
+                    "change_pct": round((price - float(fields[2])) / float(fields[2]) * 100, 2)
+                                  if fields[2] and float(fields[2]) > 0 and price else 0.0,
+                    "turnover_rate": 0.0,
+                    "pe": None, "pb": None,
+                    "total_mv": None, "float_mv": None,
+                    "_quote_time": f"{fields[30] if len(fields) > 30 else ''} {fields[31] if len(fields) > 31 else ''}".strip(),
+                }
+            except Exception as e:
+                logger.debug(f"解析新浪行情行失败: {e} | {line[:80]}")
+        return result
+    except Exception as e:
+        logger.warning(f"[新浪实时] 请求失败: {e}")
+        return {}
 
 
 # ────────────────────────────────────────────────
-# 实时行情（主 + 兜底）
+# 内存缓存（同分钟不重复请求）
 # ────────────────────────────────────────────────
 
-_spot_em_cache: tuple[pd.DataFrame | None, str] = (None, "")   # (df, date_str)
-_etf_spot_cache: tuple[pd.DataFrame | None, str] = (None, "")
+_spot_em_cache: tuple = (None, "")
+_etf_spot_cache: tuple = (None, "")
 
 
 def _get_spot_em() -> pd.DataFrame:
-    """A股全市场实时行情（东财），带简单内存缓存（同分钟不重复请求）"""
+    """A股全市场实时行情（东财），分钟缓存"""
     global _spot_em_cache
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts = _now_cst().strftime("%Y-%m-%d %H:%M")
     if _spot_em_cache[1] == ts and _spot_em_cache[0] is not None:
         return _spot_em_cache[0]
     df = ak.stock_zh_a_spot_em()
@@ -76,10 +163,10 @@ def _get_spot_em() -> pd.DataFrame:
     return df
 
 
-def _get_etf_spot() -> pd.DataFrame:
-    """ETF 全市场实时行情（东财），带简单内存缓存"""
+def _get_etf_spot_em() -> pd.DataFrame:
+    """ETF全市场实时行情（东财），分钟缓存"""
     global _etf_spot_cache
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts = _now_cst().strftime("%Y-%m-%d %H:%M")
     if _etf_spot_cache[1] == ts and _etf_spot_cache[0] is not None:
         return _etf_spot_cache[0]
     df = ak.fund_etf_spot_em()
@@ -87,155 +174,189 @@ def _get_etf_spot() -> pd.DataFrame:
     return df
 
 
+# ────────────────────────────────────────────────
+# K线获取（统一标准化列名）
+# ────────────────────────────────────────────────
+
+def _normalize_kline(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将不同来源的K线列名统一为：日期/开盘/收盘/最高/最低/成交量/成交额
+    支持东财（中文）和新浪（英文）两种格式
+    """
+    col_map = {
+        "date":   "日期",
+        "open":   "开盘",
+        "close":  "收盘",
+        "high":   "最高",
+        "low":    "最低",
+        "volume": "成交量",
+        "amount": "成交额",
+    }
+    # 只重命名存在的列
+    rename = {k: v for k, v in col_map.items() if k in df.columns}
+    if rename:
+        df = df.rename(columns=rename)
+    # 确保收盘列存在（部分ETF数据列名可能不同）
+    if "收盘" not in df.columns and "close" not in df.columns:
+        logger.warning(f"K线数据列名异常: {df.columns.tolist()}")
+    return df
+
+
+def get_stock_kline(code: str, market: str, periods: int = 20) -> pd.DataFrame:
+    """
+    获取近N日K线（日线，前复权）
+    兜底链路：
+      A股：东财 stock_zh_a_hist → 新浪 stock_zh_a_daily
+      ETF：东财 stock_zh_a_hist / fund_etf_hist_em → 新浪 fund_etf_hist_sina
+    返回标准化列名（日期/开盘/收盘/最高/最低/成交量）
+    """
+    start = (_now_cst() - timedelta(days=periods * 2)).strftime("%Y%m%d")
+    end = _now_cst().strftime("%Y%m%d")
+
+    # ── 主渠道：东财（A股 + ETF 通用）──
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=code, period="daily", adjust="qfq",
+            start_date=start, end_date=end,
+        )
+        if not df.empty:
+            df = _normalize_kline(df)
+            return df.tail(periods)
+    except Exception as e:
+        logger.warning(f"[东财K线] {code} 失败: {e}")
+
+    # ── ETF 专用：新浪历史接口 ──
+    if _is_etf(code):
+        try:
+            symbol_sina = _sina_prefix(code)
+            df = ak.fund_etf_hist_sina(symbol=symbol_sina)
+            if not df.empty:
+                df = _normalize_kline(df)
+                logger.info(f"[新浪ETF历史] {code} 成功，{len(df)}条")
+                return df.tail(periods)
+        except Exception as e:
+            logger.warning(f"[新浪ETF历史] {code} 失败: {e}")
+
+        # ETF 东财专用历史接口
+        try:
+            df = ak.fund_etf_hist_em(
+                symbol=code, period="daily", adjust="qfq",
+                start_date=start, end_date=end,
+            )
+            if not df.empty:
+                df = _normalize_kline(df)
+                logger.info(f"[东财ETF历史] {code} 成功")
+                return df.tail(periods)
+        except Exception as e:
+            logger.warning(f"[东财ETF历史] {code} 失败: {e}")
+
+    # ── A股：新浪日线 ──
+    if not _is_etf(code):
+        try:
+            symbol_sina = _sina_prefix(code)
+            df = ak.stock_zh_a_daily(symbol=symbol_sina, adjust="qfq")
+            if not df.empty:
+                df = _normalize_kline(df)
+                logger.info(f"[新浪A股日线] {code} 成功，{len(df)}条")
+                return df.tail(periods)
+        except Exception as e:
+            logger.warning(f"[新浪A股日线] {code} 失败: {e}")
+
+    logger.error(f"❌ {code} K线所有渠道均失败")
+    return pd.DataFrame()
+
+
+# ────────────────────────────────────────────────
+# 实时行情
+# ────────────────────────────────────────────────
+
 def get_stock_realtime(code: str, market: str) -> dict:
     """
-    获取单只股票/ETF 实时行情
-    兜底链路：
-      ETF → fund_etf_spot_em(东财) → 返回空
-      A股 → stock_zh_a_spot_em(东财) → stock_zh_a_spot(新浪) → 返回空
+    获取实时行情（今日最新）
+    链路：新浪 hq.sinajs.cn（首选，今日实时） → 东财（备用）
     """
+    # ── 首选：新浪实时 ──
+    sina_code = _sina_prefix(code)
+    sina_data = _get_sina_realtime([sina_code])
+    if code in sina_data and float(sina_data[code].get("price", 0)) > 0:
+        logger.debug(f"[新浪实时] {code} 成功，价格={sina_data[code]['price']}")
+        return sina_data[code]
+
+    logger.warning(f"[新浪实时] {code} 数据为空，尝试东财备用")
+
+    # ── 备用：东财（ETF）──
     if _is_etf(code):
-        # ETF 主渠道
         try:
-            df = _get_etf_spot()
+            df = _get_etf_spot_em()
             row = df[df["代码"] == code]
             if not row.empty:
                 return _parse_spot_row(row.iloc[0], code)
-            logger.warning(f"ETF {code} 在东财行情中未找到")
         except Exception as e:
-            logger.warning(f"[兜底] 东财ETF行情失败({code}): {e}")
-
-        # ETF 兜底：尝试A股全量接口（部分ETF在里面）
+            logger.warning(f"[东财ETF实时] {code} 失败: {e}")
         try:
             df = _get_spot_em()
             row = df[df["代码"] == code]
             if not row.empty:
                 return _parse_spot_row(row.iloc[0], code)
         except Exception as e:
-            logger.warning(f"[兜底] 东财A股行情中查ETF失败({code}): {e}")
-        logger.error(f"❌ {code} 行情所有渠道均失败")
-        return {}
+            logger.warning(f"[东财A股表查ETF] {code} 失败: {e}")
+    else:
+        # ── 备用：东财（A股）──
+        try:
+            df = _get_spot_em()
+            row = df[df["代码"] == code]
+            if not row.empty:
+                return _parse_spot_row(row.iloc[0], code)
+        except Exception as e:
+            logger.warning(f"[东财A股实时] {code} 失败: {e}")
 
-    # 普通A股：东财主渠道
-    try:
-        df = _get_spot_em()
-        row = df[df["代码"] == code]
-        if not row.empty:
-            return _parse_spot_row(row.iloc[0], code)
-        logger.warning(f"A股 {code} 在东财行情中未找到")
-    except Exception as e:
-        logger.warning(f"[兜底] 东财A股行情失败({code}): {e}")
-
-    # 兜底：新浪实时接口
-    try:
-        symbol = f"sh{code}" if code.startswith("6") or code.startswith("0") else f"sz{code}"
-        df_sina = ak.stock_zh_a_spot()
-        row = df_sina[df_sina["代码"] == code]
-        if not row.empty:
-            logger.info(f"[兜底] {code} 使用新浪备用行情")
-            r = row.iloc[0]
-            return {
-                "code": code,
-                "name": str(r.get("名称", "")),
-                "price": float(r.get("最新价", 0) or 0),
-                "change_pct": float(r.get("涨跌幅", 0) or 0),
-                "change_amt": float(r.get("涨跌额", 0) or 0),
-                "volume": float(r.get("成交量", 0) or 0),
-                "amount": float(r.get("成交额", 0) or 0),
-                "open": float(r.get("今开", 0) or 0),
-                "high": float(r.get("最高", 0) or 0),
-                "low": float(r.get("最低", 0) or 0),
-                "close_prev": float(r.get("昨收", 0) or 0),
-                "turnover_rate": 0.0,
-                "pe": None, "pb": None,
-                "total_mv": None, "float_mv": None,
-            }
-    except Exception as e:
-        logger.warning(f"[兜底] 新浪A股行情也失败({code}): {e}")
-
-    logger.error(f"❌ {code} 行情所有渠道均失败")
+    logger.warning(f"{code} 实时行情全渠道失败，将用历史兜底")
     return {}
-
-
-def _get_etf_hist_fallback(code: str) -> pd.DataFrame:
-    """
-    ETF 历史数据专用兜底
-    链路：新浪 fund_etf_hist_sina → 腾讯 stock_zh_a_hist_tx
-    """
-    # 新浪：sh + code
-    try:
-        symbol = f"sh{code}" if code.startswith(("5", "51", "58")) else f"sz{code}"
-        df = ak.fund_etf_hist_sina(symbol=symbol)
-        if not df.empty:
-            logger.info(f"[ETF历史兜底] {code} 新浪接口成功，{len(df)}条")
-            df = df.rename(columns={
-                "date": "日期", "open": "开盘", "close": "收盘",
-                "high": "最高", "low": "最低", "volume": "成交量", "amount": "成交额"
-            })
-            return df.tail(20)
-    except Exception as e:
-        logger.warning(f"[ETF历史兜底] 新浪失败({code}): {e}")
-
-    # 腾讯兜底
-    try:
-        symbol_tx = f"sh{code}" if code.startswith(("5", "51", "58")) else f"sz{code}"
-        start = (datetime.now() - pd.Timedelta(days=30)).strftime("%Y%m%d")
-        end = datetime.now().strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist_tx(symbol=symbol_tx, start_date=start, end_date=end)
-        if not df.empty:
-            logger.info(f"[ETF历史兜底] {code} 腾讯接口成功，{len(df)}条")
-            # 腾讯列名: 日期/开盘/收盘/最高/最低/成交量
-            df.columns = ["日期", "开盘", "收盘", "最高", "最低", "成交量"]
-            return df.tail(20)
-    except Exception as e:
-        logger.warning(f"[ETF历史兜底] 腾讯也失败({code}): {e}")
-
-    return pd.DataFrame()
 
 
 def get_stock_realtime_with_fallback(code: str, market: str) -> dict:
     """
-    获取实时行情，若 price=0（收盘/无数据），自动用最近一个交易日历史数据兜底
+    获取实时行情；若 price=0 或数据为空，自动用最近K线兜底
     """
     data = get_stock_realtime(code, market)
     if data and float(data.get("price", 0)) > 0:
         return data
 
-    # 实时数据为空或 price=0，用历史收盘数据兜底
-    logger.info(f"{code} 实时行情为空，尝试用历史日线兜底")
+    # 实时数据不可用，用历史日线最新收盘兜底
+    logger.info(f"{code} 实时行情不可用，尝试历史日线兜底")
     try:
-        # ETF 优先用专用历史接口
-        if _is_etf(code):
-            df = _get_etf_hist_fallback(code)
-            if df.empty:
-                df = get_stock_kline(code, market, periods=3)
-        else:
-            df = get_stock_kline(code, market, periods=3)
+        df = get_stock_kline(code, market, periods=5)
         if not df.empty:
             last = df.iloc[-1]
-            # 兼容东财/新浪列名
-            def _col(candidates):
-                for c in candidates:
-                    if c in df.columns:
-                        return float(last.get(c, 0) or 0)
-                return 0.0
 
-            close = _col(["收盘", "close"])
-            open_ = _col(["开盘", "open"])
-            high  = _col(["最高", "high"])
-            low   = _col(["最低", "low"])
-            vol   = _col(["成交量", "volume"])
-            amt   = _col(["成交额", "amount"])
-            date  = str(last.get("日期", last.get("date", "")))[:10]
+            def _col(names, default=0.0):
+                for n in names:
+                    if n in df.columns:
+                        try:
+                            return float(last[n] or 0)
+                        except Exception:
+                            pass
+                return default
 
-            # 计算涨跌（用前一天收盘）
+            close = _col(["收盘"])
+            open_ = _col(["开盘"])
+            high  = _col(["最高"])
+            low   = _col(["最低"])
+            vol   = _col(["成交量"])
+            amt   = _col(["成交额"])
+            date  = str(last.get("日期", ""))[:10]
+
             prev_close = 0.0
             if len(df) >= 2:
-                prev_close = float(df.iloc[-2].get("收盘", df.iloc[-2].get("close", 0)) or 0)
+                try:
+                    prev_close = float(df.iloc[-2]["收盘"] or 0)
+                except Exception:
+                    pass
+
             change_amt = round(close - prev_close, 3) if prev_close else 0
             change_pct = round(change_amt / prev_close * 100, 2) if prev_close else 0
 
-            logger.info(f"{code} 使用历史收盘数据兜底：{date} 收盘价 {close}")
+            logger.info(f"{code} 历史兜底成功：{date} 收盘价 {close}")
             result = data.copy() if data else {}
             result.update({
                 "code": code,
@@ -254,58 +375,9 @@ def get_stock_realtime_with_fallback(code: str, market: str) -> dict:
                 result["name"] = code
             return result
     except Exception as e:
-        logger.warning(f"历史数据兜底失败({code}): {e}")
+        logger.warning(f"历史兜底失败({code}): {e}")
 
-    return data
-
-
-# ────────────────────────────────────────────────
-# K 线（主 + 兜底）
-# ────────────────────────────────────────────────
-
-def get_stock_kline(code: str, market: str, periods: int = 20) -> pd.DataFrame:
-    """
-    获取近N日K线（日线，前复权）
-    兜底链路：stock_zh_a_hist(东财) → stock_zh_a_daily(新浪) → 空 DataFrame
-    """
-    start = (datetime.now() - pd.Timedelta(days=periods * 2)).strftime("%Y%m%d")
-    end   = datetime.now().strftime("%Y%m%d")
-
-    # 主渠道：东财
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=code, period="daily", adjust="qfq",
-            start_date=start, end_date=end,
-        )
-        if not df.empty:
-            return df.tail(periods)
-    except Exception as e:
-        logger.warning(f"[兜底] 东财K线失败({code}): {e}")
-
-    # 兜底：新浪日线（仅对普通A股有效）
-    if not _is_etf(code):
-        try:
-            symbol = f"sh{code}" if code.startswith("6") else f"sz{code}"
-            df = ak.stock_zh_a_daily(symbol=symbol, adjust="qfq")
-            if not df.empty:
-                logger.info(f"[兜底] {code} 使用新浪日线数据")
-                # 列名适配为东财格式
-                df = df.rename(columns={
-                    "date": "日期", "open": "开盘", "high": "最高",
-                    "low": "最低", "close": "收盘", "volume": "成交量",
-                })
-                return df.tail(periods)
-        except Exception as e:
-            logger.warning(f"[兜底] 新浪日线也失败({code}): {e}")
-
-    # ETF 专用历史接口兜底
-    if _is_etf(code):
-        df = _get_etf_hist_fallback(code)
-        if not df.empty:
-            return df
-
-    logger.error(f"❌ {code} K线所有渠道均失败")
-    return pd.DataFrame()
+    return data if data else {}
 
 
 # ────────────────────────────────────────────────
@@ -315,13 +387,13 @@ def get_stock_kline(code: str, market: str, periods: int = 20) -> pd.DataFrame:
 def get_fund_flow(code: str) -> dict:
     """
     获取个股/ETF资金流向
-    ETF → 直接读 fund_etf_spot_em 内嵌字段（已含资金流）
+    ETF → fund_etf_spot_em 内嵌字段
     A股 → stock_individual_fund_flow（东财）
     无可靠三方兜底，失败返回空字典
     """
     if _is_etf(code):
         try:
-            df = _get_etf_spot()
+            df = _get_etf_spot_em()
             row = df[df["代码"] == code]
             if not row.empty:
                 r = row.iloc[0]
@@ -334,7 +406,7 @@ def get_fund_flow(code: str) -> dict:
                     "small_net":       float(r.get("小单净流入-净额", 0) or 0),
                 }
         except Exception as e:
-            logger.warning(f"[兜底] ETF资金流失败({code}): {e}")
+            logger.warning(f"[ETF资金流] {code} 失败: {e}")
         return {}
 
     try:
@@ -351,30 +423,68 @@ def get_fund_flow(code: str) -> dict:
                 "small_net":       float(today.get("小单净流入-净额", 0) or 0),
             }
     except Exception as e:
-        logger.warning(f"资金流向获取失败({code}): {e}")
+        logger.warning(f"[A股资金流] {code} 失败: {e}")
     return {}
 
 
 # ────────────────────────────────────────────────
-# 大盘指数（主 + 兜底）
+# 大盘指数
 # ────────────────────────────────────────────────
+
+# 新浪指数代码映射（带 sh/sz 前缀）
+_INDEX_SINA_CODES = {
+    "上证指数": "sh000001",
+    "深证成指": "sz399001",
+    "创业板指": "sz399006",
+    "科创50":   "sh000688",
+    "沪深300":  "sh000300",
+    "北证50":   "bj899050",
+}
+
+_INDEX_EM_CODES = {
+    "上证指数": "000001",
+    "深证成指": "399001",
+    "创业板指": "399006",
+    "科创50":   "000688",
+    "沪深300":  "000300",
+    "北证50":   "899050",
+}
+
+_index_cache: tuple = (None, "")
+
+
+def _get_index_sina(retries: int = 3) -> pd.DataFrame:
+    """新浪指数实时数据（分钟缓存，自动重试）"""
+    global _index_cache
+    ts = _now_cst().strftime("%Y-%m-%d %H:%M")
+    if _index_cache[1] == ts and _index_cache[0] is not None:
+        return _index_cache[0]
+    import time
+    last_err = None
+    for i in range(retries):
+        try:
+            df = ak.stock_zh_index_spot_sina()
+            if not df.empty:
+                _index_cache = (df, ts)
+                return df
+        except Exception as e:
+            last_err = e
+            if i < retries - 1:
+                time.sleep(2)
+    raise RuntimeError(f"新浪指数重试{retries}次均失败: {last_err}")
+
 
 def get_market_index() -> dict:
     """
     获取大盘主要指数
-    兜底链路：stock_zh_index_spot_em(东财) → stock_zh_index_spot(新浪)
+    兜底链路：东财 stock_zh_index_spot_em → 新浪 stock_zh_index_spot_sina
     """
-    targets = {
-        "上证指数": "000001", "深证成指": "399001",
-        "创业板指": "399006", "科创50":  "000688",
-        "沪深300":  "000300", "北证50":  "899050",
-    }
     result = {}
 
     # 主渠道：东财
     try:
         df = ak.stock_zh_index_spot_em()
-        for name, code in targets.items():
+        for name, code in _INDEX_EM_CODES.items():
             row = df[df["代码"] == code]
             if not row.empty:
                 r = row.iloc[0]
@@ -389,108 +499,29 @@ def get_market_index() -> dict:
         if result:
             return result
     except Exception as e:
-        logger.warning(f"[兜底] 东财指数行情失败: {e}")
+        logger.warning(f"[东财指数] 失败: {e}")
 
-    # 兜底：新浪指数
+    # 兜底：新浪（代码带 sh/sz 前缀）
     try:
-        df = ak.stock_zh_index_spot()
-        for name, code in targets.items():
+        df = _get_index_sina()
+        for name, sina_code in _INDEX_SINA_CODES.items():
             if name in result:
                 continue
-            row = df[df["代码"] == code]
+            row = df[df["代码"] == sina_code]
             if not row.empty:
                 r = row.iloc[0]
                 result[name] = {
-                    "code": code,
-                    "price":      float(r.get("最新价", r.get("当前价", 0)) or 0),
+                    "code": sina_code,
+                    "price":      float(r.get("最新价", 0) or 0),
                     "change_pct": float(r.get("涨跌幅", 0) or 0),
                     "change_amt": float(r.get("涨跌额", 0) or 0),
                     "volume":     float(r.get("成交量", 0) or 0),
                     "amount":     float(r.get("成交额", 0) or 0),
                 }
         if result:
-            logger.info("[兜底] 使用新浪指数行情")
+            logger.info("[新浪指数] 兜底成功")
     except Exception as e:
-        logger.warning(f"[兜底] 新浪指数也失败: {e}")
-
-    return result
-
-
-# ────────────────────────────────────────────────
-# 板块行情（资金流向 + 成交量活跃）
-# ────────────────────────────────────────────────
-
-def _safe_cols(df: pd.DataFrame, preferred: list, fallback: list) -> list:
-    cols = [c for c in preferred if c in df.columns]
-    return cols if cols else [c for c in fallback if c in df.columns]
-
-
-def get_sector_performance() -> dict:
-    """
-    获取板块涨跌 + 资金流向 + 成交量最活跃板块
-    字段自适应（兼容东财接口不同版本）
-    """
-    result = {"industry": {}, "concept": {}}
-
-    for key, fetch_fn, label in [
-        ("industry", ak.stock_board_industry_name_em, "行业板块"),
-        ("concept",  ak.stock_board_concept_name_em,  "概念板块"),
-    ]:
-        try:
-            df = fetch_fn()
-            if df.empty:
-                continue
-
-            # ── 字段探查 ──
-            chg_col    = "涨跌幅" if "涨跌幅" in df.columns else None
-            amt_col    = next((c for c in ["总市值", "成交额", "换手率"] if c in df.columns), None)
-            name_col   = "板块名称" if "板块名称" in df.columns else df.columns[1]
-
-            # 主力净流入（板块级别，字段名因版本而异）
-            flow_col   = next((c for c in ["主力净流入", "主力净额", "净额", "主力净流入-净额"] if c in df.columns), None)
-
-            if not chg_col:
-                logger.warning(f"{label} 无涨跌幅字段，跳过")
-                continue
-
-            df_sorted = df.sort_values(chg_col, ascending=False)
-
-            # 涨幅 Top3 / Bottom3
-            disp_cols = _safe_cols(df, [name_col, chg_col], [name_col])
-            top3 = df_sorted.head(3)[disp_cols].to_dict("records")
-            bot3 = df_sorted.tail(3)[disp_cols].to_dict("records")
-
-            # 资金流向排名（主力净流入最多 Top3）
-            flow_top3 = []
-            if flow_col:
-                df_flow = df.copy()
-                df_flow[flow_col] = pd.to_numeric(df_flow[flow_col], errors="coerce")
-                df_flow_sorted = df_flow.sort_values(flow_col, ascending=False)
-                flow_cols = _safe_cols(df_flow, [name_col, flow_col, chg_col], [name_col, flow_col])
-                flow_top3 = df_flow_sorted.head(3)[flow_cols].to_dict("records")
-
-            # 成交量活跃排名（成交额/总市值 最大 Top3）
-            active_top3 = []
-            if amt_col:
-                df_amt = df.copy()
-                df_amt[amt_col] = pd.to_numeric(df_amt[amt_col], errors="coerce")
-                df_amt_sorted = df_amt.sort_values(amt_col, ascending=False)
-                act_cols = _safe_cols(df_amt, [name_col, amt_col, chg_col], [name_col, amt_col])
-                active_top3 = df_amt_sorted.head(3)[act_cols].to_dict("records")
-
-            result[key] = {
-                "top":       top3,
-                "bottom":    bot3,
-                "flow_top":  flow_top3,
-                "active_top": active_top3,
-                "flow_col":  flow_col,
-                "amt_col":   amt_col,
-                "name_col":  name_col,
-                "chg_col":   chg_col,
-            }
-
-        except Exception as e:
-            logger.error(f"获取{label}失败: {e}")
+        logger.warning(f"[新浪指数] 也失败: {e}")
 
     return result
 
@@ -501,8 +532,8 @@ def get_sector_performance() -> dict:
 
 def get_market_breadth() -> dict:
     """
-    获取市场涨跌家数
-    兜底链路：stock_zh_a_spot_em → 直接跳过（已在 get_stock_realtime 缓存）
+    获取市场涨跌家数（来自东财全量行情）
+    东财挂时直接返回空
     """
     try:
         df = _get_spot_em()
@@ -518,5 +549,71 @@ def get_market_breadth() -> dict:
             "total_amount": total_amt,
         }
     except Exception as e:
-        logger.error(f"获取市场宽度失败: {e}")
+        logger.warning(f"市场宽度获取失败（东财不可用）: {e}")
         return {}
+
+
+# ────────────────────────────────────────────────
+# 板块行情
+# ────────────────────────────────────────────────
+
+def _safe_cols(df: pd.DataFrame, preferred: list, fallback: list) -> list:
+    cols = [c for c in preferred if c in df.columns]
+    return cols if cols else [c for c in fallback if c in df.columns]
+
+
+def get_sector_performance() -> dict:
+    """
+    获取板块涨跌 + 资金流向 + 成交量活跃度
+    仅依赖东财（板块数据无可靠新浪备源）；东财挂时返回空
+    """
+    result = {"industry": {}, "concept": {}}
+
+    for key, fetch_fn, label in [
+        ("industry", ak.stock_board_industry_name_em, "行业板块"),
+        ("concept",  ak.stock_board_concept_name_em,  "概念板块"),
+    ]:
+        try:
+            df = fetch_fn()
+            if df.empty:
+                continue
+
+            chg_col  = "涨跌幅" if "涨跌幅" in df.columns else None
+            amt_col  = next((c for c in ["总市值", "成交额", "换手率"] if c in df.columns), None)
+            name_col = "板块名称" if "板块名称" in df.columns else df.columns[1]
+            flow_col = next((c for c in ["主力净流入", "主力净额", "净额", "主力净流入-净额"] if c in df.columns), None)
+
+            if not chg_col:
+                continue
+
+            df_sorted = df.sort_values(chg_col, ascending=False)
+            disp_cols = _safe_cols(df, [name_col, chg_col], [name_col])
+            top3 = df_sorted.head(3)[disp_cols].to_dict("records")
+            bot3 = df_sorted.tail(3)[disp_cols].to_dict("records")
+
+            flow_top3 = []
+            if flow_col:
+                df_flow = df.copy()
+                df_flow[flow_col] = pd.to_numeric(df_flow[flow_col], errors="coerce")
+                df_flow_sorted = df_flow.sort_values(flow_col, ascending=False)
+                flow_cols = _safe_cols(df_flow, [name_col, flow_col, chg_col], [name_col, flow_col])
+                flow_top3 = df_flow_sorted.head(3)[flow_cols].to_dict("records")
+
+            active_top3 = []
+            if amt_col:
+                df_amt = df.copy()
+                df_amt[amt_col] = pd.to_numeric(df_amt[amt_col], errors="coerce")
+                df_amt_sorted = df_amt.sort_values(amt_col, ascending=False)
+                act_cols = _safe_cols(df_amt, [name_col, amt_col, chg_col], [name_col, amt_col])
+                active_top3 = df_amt_sorted.head(3)[act_cols].to_dict("records")
+
+            result[key] = {
+                "top": top3, "bottom": bot3,
+                "flow_top": flow_top3, "active_top": active_top3,
+                "flow_col": flow_col, "amt_col": amt_col,
+                "name_col": name_col, "chg_col": chg_col,
+            }
+        except Exception as e:
+            logger.warning(f"[{label}] 获取失败（东财不可用）: {e}")
+
+    return result

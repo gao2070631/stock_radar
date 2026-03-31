@@ -6,8 +6,15 @@
 """
 import akshare as ak
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import logging
+
+# 固定东八区
+_CST = timezone(timedelta(hours=8))
+
+
+def _now() -> datetime:
+    return datetime.now(_CST)
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +90,7 @@ def get_morning_news(max_items: int = 12) -> str:
     try:
         df = ak.stock_info_global_cls()
         if not df.empty:
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = _now().strftime("%Y-%m-%d")
             # 优先取今天的，不够则取最新的
             today_df = df[df["发布日期"] == today] if "发布日期" in df.columns else df
             src = today_df if not today_df.empty else df
@@ -118,7 +125,7 @@ def get_morning_news(max_items: int = 12) -> str:
     if not news_items:
         return "⚠️ 暂无法获取今日新闻，请稍后关注官方媒体"
 
-    now = datetime.now()
+    now = _now()
     lines = [
         f"🌅 晨间要闻  {now.strftime('%Y-%m-%d')}",
         "━━━ 今日可能影响A股走势的重要资讯 ━━━",
@@ -153,7 +160,7 @@ _global_spot_cache: tuple = (None, "")  # (df, timestamp_min)
 def _get_global_spot() -> pd.DataFrame:
     """获取全球股指实时行情，带分钟级缓存"""
     global _global_spot_cache
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts = _now().strftime("%Y-%m-%d %H:%M")
     if _global_spot_cache[1] == ts and _global_spot_cache[0] is not None:
         return _global_spot_cache[0]
     df = ak.index_global_spot_em()
@@ -207,7 +214,7 @@ def get_global_market_close(market_key: str) -> str:
     if not results:
         return f"⚠️ {label}市场数据暂缺"
 
-    now = datetime.now()
+    now = _now()
     lines = [f"🌐 {label}收盘行情  {now.strftime('%Y-%m-%d %H:%M')}"]
     lines.append("━" * 30)
 

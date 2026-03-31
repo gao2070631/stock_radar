@@ -11,8 +11,14 @@ def analyze_kline(df: pd.DataFrame) -> dict:
     if df.empty or len(df) < 10:
         return {"summary": "K线数据不足，无法分析"}
 
-    close = df["收盘"].astype(float)
-    volume = df["成交量"].astype(float)
+    # 兼容中英文列名（fetcher 已统一，这里作双保险）
+    close_col = "收盘" if "收盘" in df.columns else "close"
+    vol_col   = "成交量" if "成交量" in df.columns else "volume"
+    if close_col not in df.columns:
+        return {"summary": f"K线列名异常: {df.columns.tolist()}"}
+
+    close = df[close_col].astype(float)
+    volume = df[vol_col].astype(float) if vol_col in df.columns else pd.Series([0]*len(df))
 
     # 均线
     ma5 = close.rolling(5).mean().iloc[-1]

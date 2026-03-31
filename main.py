@@ -15,8 +15,7 @@ A股每周交易日，9:15 ~ 14:55 每30分钟推送分析报告
 import schedule
 import time
 import logging
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone, timedelta
 
 from config import TARGET_STOCKS, PUSH_TIMES
 from fetcher import (
@@ -34,7 +33,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TZ = pytz.timezone("Asia/Shanghai")
+# 固定东八区，不依赖系统时区或 pytz
+TZ = timezone(timedelta(hours=8))
+
+
+def now_cst() -> datetime:
+    """返回当前东八区时间"""
+    return datetime.now(TZ)
 
 # 缓存当年交易日集合，避免重复请求
 _trade_dates_cache: set[str] = set()
@@ -65,7 +70,7 @@ def _load_trade_dates(year: int) -> set[str]:
 
 def is_trading_day() -> bool:
     """判断今天是否为 A 股交易日"""
-    now = datetime.now(TZ)
+    now = now_cst()
     if now.weekday() >= 5:
         return False
     today = now.strftime("%Y-%m-%d")
@@ -85,8 +90,8 @@ def run_analysis():
         logger.info("今日非交易日（含节假日），跳过A股分析")
         return
 
-    now = datetime.now(TZ)
-    logger.info(f"开始分析 {now.strftime('%Y-%m-%d %H:%M')}")
+    now = now_cst()
+    logger.info(f"开始分析 {now.strftime('%Y-%m-%d %H:%M')} CST")
 
     report_parts = []
     report_parts.append(f"🕐 {now.strftime('%Y-%m-%d %H:%M')} 股票雷达播报\n")
@@ -95,15 +100,19 @@ def run_analysis():
     for stock in TARGET_STOCKS:
         code = stock["code"]
         market = stock["market"]
+        stock_name = stock["name"]
         try:
             realtime = get_stock_realtime_with_fallback(code, market)
+            # 如果接口没返回名称，用配置里的名称兜底
+            if not realtime.get("name") or realtime["name"] == code:
+                realtime["name"] = stock_name
             kline = get_stock_kline(code, market, periods=20)
             flow = get_fund_flow(code)
             report = build_stock_report(realtime, kline, flow)
             report_parts.append(report)
         except Exception as e:
-            logger.error(f"分析 {stock['name']} 失败: {e}")
-            report_parts.append(f"⚠️ {stock['name']}（{code}）数据获取失败: {e}")
+            logger.error(f"分析 {stock_name} 失败: {e}")
+            report_parts.append(f"⚠️ {stock_name}（{code}）数据获取失败: {e}")
 
     # ── 大盘分析 ──
     try:
@@ -111,6 +120,9 @@ def run_analysis():
         breadth = get_market_breadth()
         sectors = get_sector_performance()
         market_report = build_market_report(indices, breadth, sectors)
+        # 若大盘数据完全空，给友好提示
+        if not indices and not breadth:
+            market_report = "━━━ 🏛️ 大盘概况 ━━━\n⚠️ 大盘指数数据源暂时不可用，请关注官方行情"
         report_parts.append(market_report)
     except Exception as e:
         logger.error(f"大盘分析失败: {e}")
