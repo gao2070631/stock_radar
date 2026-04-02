@@ -617,3 +617,53 @@ def get_sector_performance() -> dict:
             logger.warning(f"[{label}] 获取失败（东财不可用）: {e}")
 
     return result
+
+
+# ────────────────────────────────────────────────
+# 30分钟K线（当日）
+# ────────────────────────────────────────────────
+
+def get_stock_kline_30m(code: str, market: str, bars: int = 20) -> pd.DataFrame:
+    """
+    获取当日30分钟K线数据
+    链路：stock_zh_a_hist_min_em(period=30) → fund_etf_hist_min_em（ETF备用）
+    返回标准化列名（日期/开盘/收盘/最高/最低/成交量），只取今日数据
+    失败返回空 DataFrame
+    """
+    today = _now_cst().strftime("%Y-%m-%d")
+
+    # 主渠道：东财分钟线（A股+ETF 通用）
+    try:
+        df = ak.stock_zh_a_hist_min_em(
+            symbol=code,
+            period="30",
+            adjust="qfq",
+            start_date=today + " 09:00:00",
+            end_date=today + " 15:30:00",
+        )
+        if not df.empty:
+            df = _normalize_kline(df)
+            logger.debug(f"[东财30m] {code} 成功，{len(df)}条")
+            return df.tail(bars)
+    except Exception as e:
+        logger.warning(f"[东财30m] {code} 失败: {e}")
+
+    # ETF 备用：fund_etf_hist_min_em
+    if _is_etf(code):
+        try:
+            df = ak.fund_etf_hist_min_em(
+                symbol=code,
+                period="30",
+                adjust="qfq",
+                start_date=today + " 09:00:00",
+                end_date=today + " 15:30:00",
+            )
+            if not df.empty:
+                df = _normalize_kline(df)
+                logger.info(f"[东财ETF30m] {code} 成功，{len(df)}条")
+                return df.tail(bars)
+        except Exception as e:
+            logger.warning(f"[东财ETF30m] {code} 失败: {e}")
+
+    logger.warning(f"[30m K线] {code} 所有渠道失败，返回空")
+    return pd.DataFrame()

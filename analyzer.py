@@ -105,7 +105,59 @@ def format_amount(amount: float) -> str:
         return f"{amount:.2f}"
 
 
-def build_stock_report(stock_info: dict, kline_df: pd.DataFrame, fund_flow: dict) -> str:
+def analyze_macd_30m(df: pd.DataFrame) -> str:
+    """
+    计算30分钟K线 MACD，返回简短结论
+    EMA12, EMA26, 信号线9
+    """
+    if df.empty or len(df) < 5:
+        return "30分钟数据不足"
+
+    close_col = "收盘" if "收盘" in df.columns else "close"
+    if close_col not in df.columns:
+        return "30分钟数据异常"
+
+    close = df[close_col].astype(float)
+
+    try:
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+
+        dif_last = dif.iloc[-1]
+        dea_last = dea.iloc[-1]
+        dif_prev = dif.iloc[-2] if len(dif) >= 2 else dif_last
+        dea_prev = dea.iloc[-2] if len(dea) >= 2 else dea_last
+
+        # 金叉：DIF 从下方穿越 DEA
+        if dif_prev <= dea_prev and dif_last > dea_last:
+            zone = "多头区" if dif_last > 0 else "空头区"
+            return f"30分钟MACD金叉（{zone}），短线多头信号"
+
+        # 死叉：DIF 从上方穿越 DEA
+        if dif_prev >= dea_prev and dif_last < dea_last:
+            zone = "多头区" if dif_last > 0 else "空头区"
+            return f"30分钟MACD死叉（{zone}），注意回调"
+
+        # 未金叉/死叉，判断所处区域
+        gap = abs(dif_last - dea_last)
+        if dif_last > dea_last:
+            if dif_last > 0:
+                return "30分钟MACD多头运行，趋势偏强"
+            else:
+                return "30分钟MACD空头区偏强，观望为主"
+        else:
+            if dif_last < 0:
+                return "30分钟MACD空头运行，谨慎偏空"
+            else:
+                return "30分钟MACD多头区回落，注意方向"
+
+    except Exception as e:
+        return f"30分钟MACD计算失败"
+
+
+def build_stock_report(stock_info: dict, kline_df: pd.DataFrame, fund_flow: dict, macd_30m: str = "") -> str:
     """生成单只股票分析报告"""
     name = stock_info.get("name", "未知")
     code = stock_info.get("code", "")
@@ -149,6 +201,8 @@ def build_stock_report(stock_info: dict, kline_df: pd.DataFrame, fund_flow: dict
         f"",
         f"💡 操作建议：{kline_analysis.get('suggestion', '观望')}",
     ]
+    if macd_30m:
+        lines.append(f"📉 30分钟MACD：{macd_30m}")
     return "\n".join(lines)
 
 

@@ -19,10 +19,10 @@ from datetime import datetime, timezone, timedelta
 
 from config import TARGET_STOCKS, PUSH_TIMES
 from fetcher import (
-    get_stock_realtime, get_stock_realtime_with_fallback, get_stock_kline, get_fund_flow,
-    get_market_index, get_sector_performance, get_market_breadth
+    get_stock_realtime, get_stock_realtime_with_fallback, get_stock_kline, get_stock_kline_30m,
+    get_fund_flow, get_market_index, get_sector_performance, get_market_breadth
 )
-from analyzer import build_stock_report, build_market_report
+from analyzer import build_stock_report, build_market_report, analyze_macd_30m
 from notifier import notify
 from news_fetcher import get_morning_news, get_global_market_close, GLOBAL_MARKETS
 
@@ -108,7 +108,14 @@ def run_analysis():
                 realtime["name"] = stock_name
             kline = get_stock_kline(code, market, periods=20)
             flow = get_fund_flow(code)
-            report = build_stock_report(realtime, kline, flow)
+            # 30分钟MACD（仅交易时间有意义，失败不影响主流程）
+            macd_30m_str = ""
+            try:
+                kline_30m = get_stock_kline_30m(code, market)
+                macd_30m_str = analyze_macd_30m(kline_30m)
+            except Exception as e:
+                logger.warning(f"30分钟MACD {stock_name} 失败: {e}")
+            report = build_stock_report(realtime, kline, flow, macd_30m=macd_30m_str)
             report_parts.append(report)
         except Exception as e:
             logger.error(f"分析 {stock_name} 失败: {e}")
